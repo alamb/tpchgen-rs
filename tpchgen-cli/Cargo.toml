@@ -10,8 +10,8 @@ license = { workspace = true }
 repository = { workspace = true }
 
 [dependencies]
-arrow = "57"
-parquet = "57"
+arrow = { path = "/Users/andrewlamb/Software/arrow-rs/arrow" }
+parquet = { path = "/Users/andrewlamb/Software/arrow-rs/parquet" }
 clap = { version = "4.5.32", features = ["derive"] }
 tpchgen = { path = "../tpchgen", version = "2.0.1"}
 tpchgen-arrow = { path = "../tpchgen-arrow", version = "2.0.1" }
