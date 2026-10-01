@@ -1,14 +1,65 @@
-//! Drivers for the TPC-DS row generators, shared by the DAT and CSV outputs.
+//! Drivers for the TPC-DS outputs (DAT, CSV and Parquet).
+//!
+//! As in [`crate::tpch_cli::runner`], each table has one function, defined by
+//! `define_run!`, that names the table's row generator, CSV wrapper and Arrow
+//! reader and dispatches on the requested output format.
 
-use super::runner::PlannedTable;
+use super::csv::*;
+use super::dat::*;
+use super::plan::ChunkFormat;
+use super::runner::{plan_tables, run_plans, PlannedTable};
+use super::OutputFormat;
 use crate::generate::{Source, TextOutput};
 use crate::output_location::OutputLocation;
+use crate::progress::ProgressTracker;
 use log::info;
 use std::io;
-use std::marker::PhantomData;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use tpcdsgen::config::{Session, Table};
 use tpcdsgen::row::*;
+use tpcdsgen_arrow::*;
+
+impl OutputFormat {
+    fn chunk_format(&self) -> ChunkFormat {
+        match self {
+            Self::Dat(_) => ChunkFormat::Dat,
+            Self::Csv(_) => ChunkFormat::Csv,
+            Self::Parquet(_) => ChunkFormat::Parquet,
+        }
+    }
+
+    fn chunk_size_bytes(&self) -> i64 {
+        match self {
+            Self::Dat(dat) => dat.chunk_size_bytes,
+            Self::Csv(csv) => csv.chunk_size_bytes,
+            Self::Parquet(parquet) => parquet.row_group_bytes,
+        }
+    }
+
+    /// Generate the given TPC-DS tables, one file per `(table, session)`.
+    pub(super) async fn generate_tables(
+        self,
+        table_sessions: Vec<(Table, Session)>,
+        num_threads: usize,
+        progress: Arc<dyn ProgressTracker>,
+    ) -> io::Result<()> {
+        let work = plan_tables(
+            table_sessions,
+            self.chunk_size_bytes(),
+            self.chunk_format(),
+            &progress,
+        );
+        progress.start();
+
+        let format = Arc::new(self);
+        run_plans(work, num_threads, move |planned, num_threads| {
+            let format = Arc::clone(&format);
+            async move { run_plan(&format, planned, num_threads).await }
+        })
+        .await
+    }
+}
 
 /// Return the output location for `table`, relative to `base_location`.
 ///
@@ -40,128 +91,287 @@ pub(super) fn output_location_for_table(
     }
 }
 
-/// Trait for formatting text output for the TPC-DS row generators (DAT or CSV).
-pub(super) trait RowFormat: Clone + Send + 'static {
-    /// The file extension of this format's output files.
-    const EXTENSION: &'static str;
-
-    /// Write the header line for `table`, if this format has one. Called once
-    /// per file, before any rows.
-    fn write_header(&self, table: Table, buffer: Vec<u8>) -> Vec<u8>;
-
-    /// Format `rows` (all belonging to `table`) into `buffer`.
-    fn write_rows<I>(&self, table: Table, rows: I, buffer: Vec<u8>) -> Vec<u8>
-    where
-        I: Iterator<Item = GeneratedRow>;
-}
-
-/// Trait for creating row generators.
-pub(super) trait RowGeneratorFactory: RowGenerator + Sized {
-    fn create() -> Self;
-}
-
-macro_rules! impl_factory {
-    ($($gen:ty),*) => {
-        $(
-            impl RowGeneratorFactory for $gen {
-                fn create() -> Self { Self::new() }
-            }
-        )*
-    };
-}
-
-// Implement factory for all simple generators
-impl_factory!(
-    CallCenterRowGenerator,
-    CatalogPageRowGenerator,
-    CustomerRowGenerator,
-    CustomerAddressRowGenerator,
-    CustomerDemographicsRowGenerator,
-    DateDimRowGenerator,
-    DbgenVersionRowGenerator,
-    HouseholdDemographicsRowGenerator,
-    IncomeBandRowGenerator,
-    InventoryRowGenerator,
-    ItemRowGenerator,
-    PromotionRowGenerator,
-    ReasonRowGenerator,
-    ShipModeRowGenerator,
-    StoreRowGenerator,
-    TimeDimRowGenerator,
-    WarehouseRowGenerator,
-    WebPageRowGenerator,
-    WebSiteRowGenerator
-);
-
-// Implement factory for generators that emit sales and returns rows
-impl_factory!(
-    CatalogSalesRowGenerator,
-    StoreSalesRowGenerator,
-    WebSalesRowGenerator
-);
-
-/// Generate one planned table (one `--parts` chunk of one table) into
-/// `base_location`, using up to `num_threads` threads.
-///
-/// A sales generator emits rows for its returns table too; each output keeps
-/// only its own rows, the same way the Arrow generators produce them.
-pub(super) async fn generate_table<F: RowFormat>(
-    format: F,
-    base_location: OutputLocation,
+/// Generate one planned table (one `--parts` chunk of one table) in `format`,
+/// using up to `num_threads` threads.
+async fn run_plan(
+    format: &OutputFormat,
     planned: PlannedTable,
     num_threads: usize,
 ) -> io::Result<()> {
-    macro_rules! generate {
-        ($GENERATOR:ty) => {
-            write_table::<F, $GENERATOR>(format, &base_location, planned, num_threads).await
-        };
-    }
-
     match planned.table {
-        // Simple dimension tables
-        Table::CallCenter => generate!(CallCenterRowGenerator),
-        Table::CatalogPage => generate!(CatalogPageRowGenerator),
-        Table::Customer => generate!(CustomerRowGenerator),
-        Table::CustomerAddress => generate!(CustomerAddressRowGenerator),
-        Table::CustomerDemographics => generate!(CustomerDemographicsRowGenerator),
-        Table::DateDim => generate!(DateDimRowGenerator),
-        Table::DbgenVersion => generate!(DbgenVersionRowGenerator),
-        Table::HouseholdDemographics => generate!(HouseholdDemographicsRowGenerator),
-        Table::IncomeBand => generate!(IncomeBandRowGenerator),
-        Table::Inventory => generate!(InventoryRowGenerator),
-        Table::Item => generate!(ItemRowGenerator),
-        Table::Promotion => generate!(PromotionRowGenerator),
-        Table::Reason => generate!(ReasonRowGenerator),
-        Table::ShipMode => generate!(ShipModeRowGenerator),
-        Table::Store => generate!(StoreRowGenerator),
-        Table::TimeDim => generate!(TimeDimRowGenerator),
-        Table::Warehouse => generate!(WarehouseRowGenerator),
-        Table::WebPage => generate!(WebPageRowGenerator),
-        Table::WebSite => generate!(WebSiteRowGenerator),
-
-        // Sales tables and the returns tables their generator also emits
-        Table::StoreSales | Table::StoreReturns => generate!(StoreSalesRowGenerator),
-        Table::CatalogSales | Table::CatalogReturns => generate!(CatalogSalesRowGenerator),
-        Table::WebSales | Table::WebReturns => generate!(WebSalesRowGenerator),
-
+        Table::CallCenter => run_call_center(format, planned, num_threads).await,
+        Table::CatalogPage => run_catalog_page(format, planned, num_threads).await,
+        Table::CatalogReturns => run_catalog_returns(format, planned, num_threads).await,
+        Table::CatalogSales => run_catalog_sales(format, planned, num_threads).await,
+        Table::Customer => run_customer(format, planned, num_threads).await,
+        Table::CustomerAddress => run_customer_address(format, planned, num_threads).await,
+        Table::CustomerDemographics => {
+            run_customer_demographics(format, planned, num_threads).await
+        }
+        Table::DateDim => run_date_dim(format, planned, num_threads).await,
+        Table::DbgenVersion => run_dbgen_version(format, planned, num_threads).await,
+        Table::HouseholdDemographics => {
+            run_household_demographics(format, planned, num_threads).await
+        }
+        Table::IncomeBand => run_income_band(format, planned, num_threads).await,
+        Table::Inventory => run_inventory(format, planned, num_threads).await,
+        Table::Item => run_item(format, planned, num_threads).await,
+        Table::Promotion => run_promotion(format, planned, num_threads).await,
+        Table::Reason => run_reason(format, planned, num_threads).await,
+        Table::ShipMode => run_ship_mode(format, planned, num_threads).await,
+        Table::Store => run_store(format, planned, num_threads).await,
+        Table::StoreReturns => run_store_returns(format, planned, num_threads).await,
+        Table::StoreSales => run_store_sales(format, planned, num_threads).await,
+        Table::TimeDim => run_time_dim(format, planned, num_threads).await,
+        Table::Warehouse => run_warehouse(format, planned, num_threads).await,
+        Table::WebPage => run_web_page(format, planned, num_threads).await,
+        Table::WebReturns => run_web_returns(format, planned, num_threads).await,
+        Table::WebSales => run_web_sales(format, planned, num_threads).await,
+        Table::WebSite => run_web_site(format, planned, num_threads).await,
         // Source tables - skip
         _ => Ok(()),
     }
 }
 
-/// Generate the rows in `planned`.
+/// Define the function that generates one planned table in whichever format
+/// was requested.
+///
+/// Arguments:
+/// `$FUN_NAME`: name of the function to create
+/// `$GENERATOR`: the table's row generator type, an `Iterator` over its rows
+/// `$DAT_SOURCE`: the [`Source`] type to use for DAT format
+/// `$CSV_SOURCE`: the [`Source`] type to use for CSV format
+/// `$PARQUET_SOURCE`: the [`arrow::record_batch::RecordBatchReader`] type to use for Parquet format
+macro_rules! define_run {
+    ($FUN_NAME:ident, $GENERATOR:ident, $DAT_SOURCE:ty, $CSV_SOURCE:ty, $PARQUET_SOURCE:ty) => {
+        async fn $FUN_NAME(
+            format: &OutputFormat,
+            planned: PlannedTable,
+            num_threads: usize,
+        ) -> io::Result<()> {
+            /// The rows of one chunk: source rows `range` of `source_rows`
+            fn rows(session: Session, source_rows: u64, range: RangeInclusive<u64>) -> $GENERATOR {
+                let mut rows = <$GENERATOR>::new(session, source_rows);
+                rows.set_source_row_range(*range.start(), *range.end());
+                rows
+            }
+
+            match format {
+                OutputFormat::Dat(dat) => {
+                    let compat_mode = dat.compat_mode;
+                    let sources = planned.chunks().map(move |(session, source_rows, range)| {
+                        <$DAT_SOURCE>::new(rows(session, source_rows, range), compat_mode)
+                    });
+                    write_text(&dat.base_location, "dat", planned, num_threads, sources).await
+                }
+                OutputFormat::Csv(csv) => {
+                    let delimiter = csv.delimiter;
+                    let sources = planned.chunks().map(move |(session, source_rows, range)| {
+                        <$CSV_SOURCE>::new(rows(session, source_rows, range), delimiter)
+                    });
+                    write_text(&csv.base_location, "csv", planned, num_threads, sources).await
+                }
+                OutputFormat::Parquet(parquet) => {
+                    parquet
+                        .write_table(planned, num_threads, |session, start, end| {
+                            <$PARQUET_SOURCE>::new(session).with_source_row_range(start, end)
+                        })
+                        .await
+                }
+            }
+        }
+    };
+}
+
+define_run!(
+    run_call_center,
+    CallCenterRowGenerator,
+    CallCenterDatSource,
+    CallCenterCsvSource,
+    CallCenterArrow
+);
+define_run!(
+    run_catalog_page,
+    CatalogPageRowGenerator,
+    CatalogPageDatSource,
+    CatalogPageCsvSource,
+    CatalogPageArrow
+);
+define_run!(
+    run_catalog_returns,
+    CatalogReturnsRowGenerator,
+    CatalogReturnsDatSource,
+    CatalogReturnsCsvSource,
+    CatalogReturnsArrow
+);
+define_run!(
+    run_catalog_sales,
+    CatalogSalesRowGenerator,
+    CatalogSalesDatSource,
+    CatalogSalesCsvSource,
+    CatalogSalesArrow
+);
+define_run!(
+    run_customer,
+    CustomerRowGenerator,
+    CustomerDatSource,
+    CustomerCsvSource,
+    CustomerArrow
+);
+define_run!(
+    run_customer_address,
+    CustomerAddressRowGenerator,
+    CustomerAddressDatSource,
+    CustomerAddressCsvSource,
+    CustomerAddressArrow
+);
+define_run!(
+    run_customer_demographics,
+    CustomerDemographicsRowGenerator,
+    CustomerDemographicsDatSource,
+    CustomerDemographicsCsvSource,
+    CustomerDemographicsArrow
+);
+define_run!(
+    run_date_dim,
+    DateDimRowGenerator,
+    DateDimDatSource,
+    DateDimCsvSource,
+    DateDimArrow
+);
+define_run!(
+    run_dbgen_version,
+    DbgenVersionRowGenerator,
+    DbgenVersionDatSource,
+    DbgenVersionCsvSource,
+    DbgenVersionArrow
+);
+define_run!(
+    run_household_demographics,
+    HouseholdDemographicsRowGenerator,
+    HouseholdDemographicsDatSource,
+    HouseholdDemographicsCsvSource,
+    HouseholdDemographicsArrow
+);
+define_run!(
+    run_income_band,
+    IncomeBandRowGenerator,
+    IncomeBandDatSource,
+    IncomeBandCsvSource,
+    IncomeBandArrow
+);
+define_run!(
+    run_inventory,
+    InventoryRowGenerator,
+    InventoryDatSource,
+    InventoryCsvSource,
+    InventoryArrow
+);
+define_run!(
+    run_item,
+    ItemRowGenerator,
+    ItemDatSource,
+    ItemCsvSource,
+    ItemArrow
+);
+define_run!(
+    run_promotion,
+    PromotionRowGenerator,
+    PromotionDatSource,
+    PromotionCsvSource,
+    PromotionArrow
+);
+define_run!(
+    run_reason,
+    ReasonRowGenerator,
+    ReasonDatSource,
+    ReasonCsvSource,
+    ReasonArrow
+);
+define_run!(
+    run_ship_mode,
+    ShipModeRowGenerator,
+    ShipModeDatSource,
+    ShipModeCsvSource,
+    ShipModeArrow
+);
+define_run!(
+    run_store,
+    StoreRowGenerator,
+    StoreDatSource,
+    StoreCsvSource,
+    StoreArrow
+);
+define_run!(
+    run_store_returns,
+    StoreReturnsRowGenerator,
+    StoreReturnsDatSource,
+    StoreReturnsCsvSource,
+    StoreReturnsArrow
+);
+define_run!(
+    run_store_sales,
+    StoreSalesRowGenerator,
+    StoreSalesDatSource,
+    StoreSalesCsvSource,
+    StoreSalesArrow
+);
+define_run!(
+    run_time_dim,
+    TimeDimRowGenerator,
+    TimeDimDatSource,
+    TimeDimCsvSource,
+    TimeDimArrow
+);
+define_run!(
+    run_warehouse,
+    WarehouseRowGenerator,
+    WarehouseDatSource,
+    WarehouseCsvSource,
+    WarehouseArrow
+);
+define_run!(
+    run_web_page,
+    WebPageRowGenerator,
+    WebPageDatSource,
+    WebPageCsvSource,
+    WebPageArrow
+);
+define_run!(
+    run_web_returns,
+    WebReturnsRowGenerator,
+    WebReturnsDatSource,
+    WebReturnsCsvSource,
+    WebReturnsArrow
+);
+define_run!(
+    run_web_sales,
+    WebSalesRowGenerator,
+    WebSalesDatSource,
+    WebSalesCsvSource,
+    WebSalesArrow
+);
+define_run!(
+    run_web_site,
+    WebSiteRowGenerator,
+    WebSiteDatSource,
+    WebSiteCsvSource,
+    WebSiteArrow
+);
+
+/// Write `sources`, the chunks of `planned`, as one text file.
 ///
 /// Progress is counted in chunks; the totals are registered by
 /// [`super::runner::plan_tables`]
-async fn write_table<F, G>(
-    format: F,
+async fn write_text<I>(
     base_location: &OutputLocation,
+    extension: &str,
     planned: PlannedTable,
     num_threads: usize,
+    sources: I,
 ) -> io::Result<()>
 where
-    F: RowFormat,
-    G: RowGeneratorFactory + Send + 'static,
+    I: Iterator<Item: Source + 'static> + Send + 'static,
 {
     let PlannedTable {
         table,
@@ -170,7 +380,7 @@ where
         progress,
     } = planned;
 
-    let location = output_location_for_table(base_location, table, F::EXTENSION, &session)?;
+    let location = output_location_for_table(base_location, table, extension, &session)?;
     let chunk_count = plan.chunk_count() as u64;
     let scale_factor = session.get_scaling().get_scale();
     let part = session.get_chunk_number();
@@ -180,15 +390,6 @@ where
     } else {
         String::new()
     };
-    let source_rows = session.get_scaling().get_row_count(table.source_table());
-    let sources = plan.into_iter().map(move |range| RowSource::<F, G> {
-        format: format.clone(),
-        table,
-        session: session.clone(),
-        source_rows,
-        range,
-        generator: PhantomData,
-    });
 
     info!(
         "Writing table {table} (SF={scale_factor}, {chunk_count} chunk{}){partition} to {location} using {num_threads} thread{}",
@@ -210,41 +411,4 @@ where
     }
     progress.complete();
     Ok(())
-}
-
-/// Generates the text for one chunk (a range of source rows) of one table.
-struct RowSource<F, G> {
-    format: F,
-    table: Table,
-    session: Session,
-    source_rows: u64,
-    /// The 1-based inclusive source rows of this chunk
-    range: RangeInclusive<u64>,
-    generator: PhantomData<G>,
-}
-
-impl<F, G> Source for RowSource<F, G>
-where
-    F: RowFormat,
-    G: RowGeneratorFactory + Send + 'static,
-{
-    fn header(&self, buffer: Vec<u8>) -> Vec<u8> {
-        self.format.write_header(self.table, buffer)
-    }
-
-    fn create(self, buffer: Vec<u8>) -> Vec<u8> {
-        let Self {
-            format,
-            table,
-            session,
-            source_rows,
-            range,
-            ..
-        } = self;
-
-        let mut rows = RowIter::new(G::create(), session, source_rows);
-        rows.set_source_row_range(*range.start(), *range.end());
-
-        format.write_rows(table, rows.filter(|row| row.table() == table), buffer)
-    }
 }

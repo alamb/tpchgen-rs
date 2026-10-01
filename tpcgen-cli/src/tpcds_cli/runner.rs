@@ -11,6 +11,7 @@ use log::info;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tpcdsgen::config::{Session, Table};
 
@@ -26,6 +27,21 @@ pub(super) struct PlannedTable {
     pub(super) plan: TpcdsGenerationPlan,
     /// Progress reporter
     pub(super) progress: ProgressHandle,
+}
+
+impl PlannedTable {
+    /// The `(session, source_rows, range)` of each chunk, for building one
+    /// [`crate::generate::Source`] per chunk.
+    pub(super) fn chunks(&self) -> impl Iterator<Item = (Session, u64, RangeInclusive<u64>)> {
+        let session = self.session.clone();
+        let source_rows = session
+            .get_scaling()
+            .get_row_count(self.table.source_table());
+        self.plan
+            .clone()
+            .into_iter()
+            .map(move |range| (session.clone(), source_rows, range))
+    }
 }
 
 /// Plan every requested `(table, session)` and register the progress bars.

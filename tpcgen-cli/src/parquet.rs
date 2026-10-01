@@ -70,6 +70,43 @@ pub(crate) fn reject_unsupported_encoding(encoding: Encoding) -> io::Result<()> 
     }
 }
 
+/// Checks each `--column-encoding` column against the selected tables'
+/// `schemas`.
+///
+/// Rejects an encoding [`reject_unsupported_encoding`] rejects, and a column
+/// name that matches no schema (almost always a typo). A column that matches
+/// only some tables is fine: it is applied there and skipped elsewhere.
+pub(crate) fn validate_column_encodings(
+    schemas: impl IntoIterator<Item = SchemaRef>,
+    encodings: &[(String, Encoding)],
+) -> io::Result<()> {
+    let schemas: Vec<SchemaRef> = schemas.into_iter().collect();
+    for (col, enc) in encodings {
+        reject_unsupported_encoding(*enc)?;
+        let matches_any_table = schemas
+            .iter()
+            .any(|schema| schema.fields().iter().any(|f| f.name() == col));
+        if !matches_any_table {
+            return Err(io::Error::other(format!(
+                "column '{col}' for --column-encoding not found in any selected table"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Keeps only the encodings whose column exists in `schema`.
+pub(crate) fn column_encodings_for_table(
+    schema: &Schema,
+    encodings: &[(String, Encoding)],
+) -> Vec<(String, Encoding)> {
+    encodings
+        .iter()
+        .filter(|(col, _)| schema.fields().iter().any(|f| f.name() == col))
+        .cloned()
+        .collect()
+}
+
 /// Applies `encodings` to `builder`.
 ///
 /// Does not check an encoding against the column's physical type (RLE
@@ -116,6 +153,7 @@ pub async fn generate_parquet<W, I>(
     num_threads: usize,
     parquet_compression: Compression,
     column_encodings: Option<&[(String, Encoding)]>,
+    field_ids: bool,
     progress: ProgressHandle,
 ) -> Result<(), io::Error>
 where
@@ -131,7 +169,11 @@ where
     let Some(first_iter) = iter_iter.peek() else {
         return Ok(()); // no data
     };
-    let schema = Arc::new(schema_with_field_ids(&first_iter.schema()));
+    let schema = if field_ids {
+        Arc::new(schema_with_field_ids(&first_iter.schema()))
+    } else {
+        first_iter.schema()
+    };
 
     // Compute the parquet schema first. apply_column_encodings needs it to
     // map column names to a ColumnPath and check they exist. Nothing here
@@ -248,6 +290,8 @@ pub(crate) struct ParquetOutput<'a, I> {
     pub(crate) compression: Compression,
     /// Per-column encodings (`--column-encoding`)
     pub(crate) column_encodings: Option<&'a [(String, Encoding)]>,
+    /// Write sequential Parquet field IDs (`--field-ids`)
+    pub(crate) field_ids: bool,
     /// Advanced once per written row group
     pub(crate) progress: ProgressHandle,
 }
@@ -264,6 +308,7 @@ where
             self.num_threads,
             self.compression,
             self.column_encodings,
+            self.field_ids,
             self.progress,
         )
         .await
@@ -323,7 +368,48 @@ mod tests {
         Arc,
     };
     use tpchgen::generators::RegionGenerator;
-    use tpchgen_arrow::RegionArrow;
+    use tpchgen_arrow::{NationArrow, RegionArrow};
+
+    #[test]
+    fn validate_column_encodings_accepts_a_column_present_on_just_one_table() {
+        // r_name exists only on region, not nation.
+        let schemas = [RegionArrow::schema_ref(), NationArrow::schema_ref()];
+        let encodings = [("r_name".to_string(), Encoding::PLAIN)];
+        assert!(validate_column_encodings(schemas, &encodings).is_ok());
+    }
+
+    #[test]
+    fn validate_column_encodings_rejects_a_typo() {
+        let schemas = [RegionArrow::schema_ref(), NationArrow::schema_ref()];
+        let encodings = [("r_name_typo".to_string(), Encoding::PLAIN)];
+        let err = validate_column_encodings(schemas, &encodings).unwrap_err();
+        assert!(err.to_string().contains("column 'r_name_typo'"), "{err}");
+    }
+
+    #[test]
+    fn validate_column_encodings_rejects_dictionary_encoding() {
+        // The column is real, so the only reason to fail is the encoding.
+        let schemas = [RegionArrow::schema_ref()];
+        let encodings = [("r_name".to_string(), Encoding::PLAIN_DICTIONARY)];
+        let err = validate_column_encodings(schemas, &encodings).unwrap_err();
+        assert!(err.to_string().contains("dictionary encoding"), "{err}");
+    }
+
+    #[test]
+    fn column_encodings_for_table_keeps_only_matching_columns() {
+        let encodings = [
+            ("r_name".to_string(), Encoding::PLAIN),
+            ("l_comment".to_string(), Encoding::PLAIN),
+        ];
+        assert_eq!(
+            column_encodings_for_table(&RegionArrow::schema_ref(), &encodings),
+            vec![("r_name".to_string(), Encoding::PLAIN)]
+        );
+        assert_eq!(
+            column_encodings_for_table(&NationArrow::schema_ref(), &encodings),
+            Vec::new()
+        );
+    }
 
     #[test]
     fn reject_unsupported_encoding_rejects_dictionary_and_bit_packed() {
@@ -373,6 +459,7 @@ mod tests {
             1,
             Compression::UNCOMPRESSED,
             None,
+            true,
             ProgressHandle::new(|_, _| {}),
         )
         .await
@@ -397,6 +484,7 @@ mod tests {
             1,
             Compression::UNCOMPRESSED,
             None,
+            true,
             progress,
         )
         .await
@@ -420,6 +508,7 @@ mod tests {
             1,
             Compression::UNCOMPRESSED,
             encodings,
+            true,
             progress,
         )
         .await

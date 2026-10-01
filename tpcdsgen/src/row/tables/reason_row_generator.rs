@@ -4,30 +4,31 @@ use crate::distribution::ReturnReasonsDistribution;
 use crate::error::Result;
 use crate::generator::ReasonGeneratorColumn;
 use crate::random::RandomValueGenerator;
-use crate::row::{AbstractRowGenerator, ReasonRow, RowGenerator, RowGeneratorResult};
+use crate::row::{AbstractRowGenerator, ReasonRow};
 use crate::table::Table;
 
 /// Row generator for the REASON table (ReasonRowGenerator)
 pub struct ReasonRowGenerator {
     abstract_generator: AbstractRowGenerator,
-}
-
-impl Default for ReasonRowGenerator {
-    fn default() -> Self {
-        Self::new()
-    }
+    session: Session,
+    current_row: u64,
+    row_count: u64,
 }
 
 impl ReasonRowGenerator {
-    /// Create a new ReasonRowGenerator
-    pub fn new() -> Self {
+    /// Generate source rows `1..=row_count`.
+    pub fn new(session: Session, row_count: u64) -> Self {
         Self {
             abstract_generator: AbstractRowGenerator::new(Table::Reason),
+            session,
+            current_row: 1,
+            row_count,
         }
     }
 
     /// Generate a ReasonRow with realistic data following Java implementation
-    fn generate_reason_row(&mut self, row_number: u64, session: &Session) -> Result<ReasonRow> {
+    fn generate_reason_row(&mut self, row_number: u64) -> Result<ReasonRow> {
+        let session = &self.session;
         let row_number_i64 = i64::try_from(row_number).expect("row number fits in i64");
 
         // Create null bit map (createNullBitMap call)
@@ -58,26 +59,35 @@ impl ReasonRowGenerator {
             r_reason_desc.to_string(),
         ))
     }
-}
 
-impl RowGenerator for ReasonRowGenerator {
-    fn generate_row_and_child_rows(
-        &mut self,
-        row_number: u64,
-        session: &Session,
-        _parent_row_generator: Option<&mut dyn RowGenerator>,
-        _child_row_generator: Option<&mut dyn RowGenerator>,
-    ) -> Result<RowGeneratorResult> {
-        let row = self.generate_reason_row(row_number, session)?;
-        Ok(RowGeneratorResult::new(row))
-    }
-
-    fn consume_remaining_seeds_for_row(&mut self) {
-        self.abstract_generator.consume_remaining_seeds_for_row();
-    }
-
-    fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
+    /// Start generating at `starting_row_number` (1-based), fast forwarding
+    /// the random number streams to that row.
+    pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
         self.abstract_generator
             .skip_rows_until_starting_row_number(starting_row_number);
+        self.current_row = starting_row_number;
+    }
+
+    /// Restrict generation to source rows
+    /// `starting_row_number..=ending_row_number` (1-based, inclusive).
+    ///
+    /// The ending row number is clamped to the table's row count.
+    pub fn set_source_row_range(&mut self, starting_row_number: u64, ending_row_number: u64) {
+        self.skip_rows_until_starting_row_number(starting_row_number);
+        self.row_count = self.row_count.min(ending_row_number);
+    }
+}
+
+impl Iterator for ReasonRowGenerator {
+    type Item = ReasonRow;
+
+    fn next(&mut self) -> Option<ReasonRow> {
+        if self.current_row > self.row_count {
+            return None;
+        }
+        let row = self.generate_reason_row(self.current_row).expect("row gen");
+        self.abstract_generator.consume_remaining_seeds_for_row();
+        self.current_row += 1;
+        Some(row)
     }
 }

@@ -58,7 +58,6 @@ impl OutputFormat {
 }
 
 #[derive(Args)]
-#[command(version)]
 #[command(
     // -h output
     about = "TPC-DS Data Generator",
@@ -129,10 +128,10 @@ struct ParquetArgs {
 
     /// Parquet block compression format.
     ///
-    /// Supported values: UNCOMPRESSED, ZSTD(N), SNAPPY, GZIP, LZO, BROTLI, LZ4
+    /// Supported values: UNCOMPRESSED, ZSTD(N), SNAPPY, GZIP(N), BROTLI(N), LZ4_RAW, LZ4
     ///
-    /// Note to use zstd you must supply the "compression" level (1-22)
-    /// as a number in parentheses, e.g. `ZSTD(1)` for level 1 compression.
+    /// ZSTD, GZIP, and BROTLI require a compression level as a number in
+    /// parentheses, e.g. `ZSTD(1)`. Levels: ZSTD 1-22, GZIP 0-9, BROTLI 0-11.
     ///
     /// Using `ZSTD` results in the best compression, but is about 2x slower than
     /// UNCOMPRESSED. For example, for the lineitem table at SF=10
@@ -182,6 +181,19 @@ struct ParquetArgs {
         help_heading = "Parquet Options"
     )]
     column_encoding: Option<Vec<(String, Encoding)>>,
+
+    /// Write Parquet field IDs (true or false).
+    ///
+    /// When true, each column gets a field ID equal to its 1-based position.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = ArgAction::Set,
+        value_name = "BOOL",
+        hide_possible_values = true,
+        help_heading = "Parquet Options"
+    )]
+    field_ids: bool,
 }
 
 #[derive(Args)]
@@ -277,7 +289,12 @@ impl CsvArgs {
 impl ParquetArgs {
     async fn run(self) -> Result<()> {
         self.common
-            .run_parquet(self.compression, self.row_group_bytes, self.column_encoding)
+            .run_parquet(
+                self.compression,
+                self.row_group_bytes,
+                self.column_encoding,
+                self.field_ids,
+            )
             .await
     }
 }
@@ -298,12 +315,14 @@ impl CommonArgs {
         compression: Compression,
         row_group_bytes: i64,
         column_encoding: Option<Vec<(String, Encoding)>>,
+        field_ids: bool,
     ) -> Result<()> {
         let output = parquet::Parquet::new(
             self.base_location()?,
             compression,
             row_group_bytes,
             column_encoding,
+            field_ids,
         );
         let output_format = OutputFormat::Parquet(output);
         self.run_output(output_format).await
@@ -375,27 +394,17 @@ impl CommonArgs {
             }
         }
 
+        if let OutputFormat::Parquet(output) = &output_format {
+            output.validate(&table_sessions)?;
+        }
+
         // Create the output directory if it doesn't exist (writing to stdout
         // creates no directories)
         base_location.create_dir_all()?;
 
-        match output_format {
-            OutputFormat::Dat(output) => {
-                output
-                    .generate_tables(table_sessions, num_threads, progress.clone())
-                    .await?;
-            }
-            OutputFormat::Csv(output) => {
-                output
-                    .generate_tables(table_sessions, num_threads, progress.clone())
-                    .await?;
-            }
-            OutputFormat::Parquet(output) => {
-                output
-                    .generate_tables(table_sessions, num_threads, progress.clone())
-                    .await?;
-            }
-        }
+        output_format
+            .generate_tables(table_sessions, num_threads, progress.clone())
+            .await?;
 
         progress.finish();
         info!("Generation complete in {:.2?}!", total_start.elapsed());

@@ -1,6 +1,6 @@
 //! TPC-DS CSV output.
 //!
-//! Rows are formatted via the `tpcdsgen::csv` Display wrappers (the same
+//! Rows are formatted via the [`tpcdsgen::csv::CsvRow`] wrappers (the same
 //! model as the TPC-H CSV output): one header line, then one line per row
 //! with the same field values as the DAT output, joined by the delimiter
 //! with no trailing separator. Free-text columns that can contain the
@@ -15,23 +15,18 @@
 //!   `--delimiter` is only safe for delimiters that no unquoted column
 //!   contains (`,`, `|`, tab, `;`).
 
+use crate::generate::Source;
 use crate::output_location::OutputLocation;
-use crate::progress::ProgressTracker;
-use crate::tpcds_cli::generate::{generate_table, RowFormat};
-use crate::tpcds_cli::plan::ChunkFormat;
-use crate::tpcds_cli::runner::{plan_tables, run_plans};
-use std::io::{self, Write};
-use std::sync::Arc;
-use tpcdsgen::config::{Session, Table};
-use tpcdsgen::csv::{csv_header, GeneratedRowCsv};
-use tpcdsgen::row::GeneratedRow;
+use std::io::Write;
+use tpcdsgen::csv::*;
+use tpcdsgen::row::*;
 
 /// CSV output generator.
 #[derive(Debug, Clone)]
 pub(super) struct Csv {
-    base_location: OutputLocation,
+    pub(super) base_location: OutputLocation,
     pub(super) delimiter: char,
-    chunk_size_bytes: i64,
+    pub(super) chunk_size_bytes: i64,
 }
 
 impl Csv {
@@ -46,66 +41,96 @@ impl Csv {
             chunk_size_bytes,
         }
     }
+}
 
-    /// Generate the given TPC-DS tables as CSV files.
-    pub(super) async fn generate_tables(
-        &self,
-        table_sessions: Vec<(Table, Session)>,
-        num_threads: usize,
-        progress: Arc<dyn ProgressTracker>,
-    ) -> io::Result<()> {
-        // Check every header up front: a CSV file is not valid without one,
-        // and `write_header` cannot report an error once generation starts.
-        for (table, _) in &table_sessions {
-            if csv_header(*table, self.delimiter).is_none() {
-                return Err(io::Error::other(format!(
-                    "table {} has no CSV output",
-                    table.get_name()
-                )));
+/// Define a [`Source`] that writes `$ROWS` as CSV lines via the `$CSV`
+/// [`CsvRow`] wrapper
+macro_rules! define_csv_source {
+    ($SOURCE_NAME:ident, $ROWS:ty, $CSV:ident) => {
+        pub(super) struct $SOURCE_NAME {
+            rows: $ROWS,
+            delimiter: char,
+        }
+
+        impl $SOURCE_NAME {
+            pub(super) fn new(rows: $ROWS, delimiter: char) -> Self {
+                Self { rows, delimiter }
             }
         }
 
-        let work = plan_tables(
-            table_sessions,
-            self.chunk_size_bytes,
-            ChunkFormat::Csv,
-            &progress,
-        );
-        progress.start();
+        impl Source for $SOURCE_NAME {
+            fn header(&self, mut buffer: Vec<u8>) -> Vec<u8> {
+                writeln!(buffer, "{}", $CSV::header_with_delimiter(self.delimiter))
+                    .expect("writing to memory cannot fail");
+                buffer
+            }
 
-        let this = self.clone();
-        run_plans(work, num_threads, move |planned, num_threads| {
-            let format = this.clone();
-            let base_location = this.base_location.clone();
-            async move { generate_table(format, base_location, planned, num_threads).await }
-        })
-        .await
-    }
-}
-
-impl RowFormat for Csv {
-    const EXTENSION: &'static str = "csv";
-
-    fn write_header(&self, table: Table, mut buffer: Vec<u8>) -> Vec<u8> {
-        // Checked by `generate_tables` before any generation starts.
-        let header = csv_header(table, self.delimiter)
-            .unwrap_or_else(|| panic!("table {} has no CSV output", table.get_name()));
-        writeln!(buffer, "{header}").expect("writing to memory cannot fail");
-        buffer
-    }
-
-    fn write_rows<I>(&self, _table: Table, rows: I, mut buffer: Vec<u8>) -> Vec<u8>
-    where
-        I: Iterator<Item = GeneratedRow>,
-    {
-        for row in rows {
-            writeln!(
-                buffer,
-                "{}",
-                GeneratedRowCsv::with_delimiter(&row, self.delimiter)
-            )
-            .expect("writing to memory cannot fail");
+            fn create(self, mut buffer: Vec<u8>) -> Vec<u8> {
+                for row in self.rows {
+                    writeln!(buffer, "{}", $CSV::with_delimiter(&row, self.delimiter))
+                        .expect("writing to memory cannot fail");
+                }
+                buffer
+            }
         }
-        buffer
-    }
+    };
 }
+
+// Define .csv sources for all tables
+define_csv_source!(CallCenterCsvSource, CallCenterRowGenerator, CallCenterCsv);
+define_csv_source!(
+    CatalogPageCsvSource,
+    CatalogPageRowGenerator,
+    CatalogPageCsv
+);
+define_csv_source!(
+    CatalogReturnsCsvSource,
+    CatalogReturnsRowGenerator,
+    CatalogReturnsCsv
+);
+define_csv_source!(
+    CatalogSalesCsvSource,
+    CatalogSalesRowGenerator,
+    CatalogSalesCsv
+);
+define_csv_source!(CustomerCsvSource, CustomerRowGenerator, CustomerCsv);
+define_csv_source!(
+    CustomerAddressCsvSource,
+    CustomerAddressRowGenerator,
+    CustomerAddressCsv
+);
+define_csv_source!(
+    CustomerDemographicsCsvSource,
+    CustomerDemographicsRowGenerator,
+    CustomerDemographicsCsv
+);
+define_csv_source!(DateDimCsvSource, DateDimRowGenerator, DateDimCsv);
+define_csv_source!(
+    DbgenVersionCsvSource,
+    DbgenVersionRowGenerator,
+    DbgenVersionCsv
+);
+define_csv_source!(
+    HouseholdDemographicsCsvSource,
+    HouseholdDemographicsRowGenerator,
+    HouseholdDemographicsCsv
+);
+define_csv_source!(IncomeBandCsvSource, IncomeBandRowGenerator, IncomeBandCsv);
+define_csv_source!(InventoryCsvSource, InventoryRowGenerator, InventoryCsv);
+define_csv_source!(ItemCsvSource, ItemRowGenerator, ItemCsv);
+define_csv_source!(PromotionCsvSource, PromotionRowGenerator, PromotionCsv);
+define_csv_source!(ReasonCsvSource, ReasonRowGenerator, ReasonCsv);
+define_csv_source!(ShipModeCsvSource, ShipModeRowGenerator, ShipModeCsv);
+define_csv_source!(StoreCsvSource, StoreRowGenerator, StoreCsv);
+define_csv_source!(
+    StoreReturnsCsvSource,
+    StoreReturnsRowGenerator,
+    StoreReturnsCsv
+);
+define_csv_source!(StoreSalesCsvSource, StoreSalesRowGenerator, StoreSalesCsv);
+define_csv_source!(TimeDimCsvSource, TimeDimRowGenerator, TimeDimCsv);
+define_csv_source!(WarehouseCsvSource, WarehouseRowGenerator, WarehouseCsv);
+define_csv_source!(WebPageCsvSource, WebPageRowGenerator, WebPageCsv);
+define_csv_source!(WebReturnsCsvSource, WebReturnsRowGenerator, WebReturnsCsv);
+define_csv_source!(WebSalesCsvSource, WebSalesRowGenerator, WebSalesCsv);
+define_csv_source!(WebSiteCsvSource, WebSiteRowGenerator, WebSiteCsv);

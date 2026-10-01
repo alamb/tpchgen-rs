@@ -16,17 +16,11 @@
 //!
 //! Generates TPC-DS benchmark data with byte-for-byte compatibility with the Java reference.
 
-use super::generate::{generate_table, RowFormat};
-use super::plan::ChunkFormat;
-use super::runner::{plan_tables, run_plans};
+use crate::generate::Source;
 use crate::output_location::OutputLocation;
-use crate::progress::ProgressTracker;
-use std::io;
-use std::sync::Arc;
-
-use tpcdsgen::config::{CompatMode, Session, Table};
+use tpcdsgen::config::CompatMode;
 use tpcdsgen::output::DatWriter;
-use tpcdsgen::row::GeneratedRow;
+use tpcdsgen::row::*;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -34,11 +28,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Debug, Clone)]
 pub(super) struct Dat {
     /// Where to write the output
-    base_location: OutputLocation,
+    pub(super) base_location: OutputLocation,
     /// Which reference implementation to match.
-    compat_mode: CompatMode,
+    pub(super) compat_mode: CompatMode,
     /// Target size of each generated buffer
-    chunk_size_bytes: i64,
+    pub(super) chunk_size_bytes: i64,
 }
 
 impl Dat {
@@ -53,58 +47,78 @@ impl Dat {
             chunk_size_bytes,
         })
     }
-
-    /// Generate the given TPC-DS tables as DAT files.
-    pub(super) async fn generate_tables(
-        &self,
-        table_sessions: Vec<(Table, Session)>,
-        num_threads: usize,
-        progress: Arc<dyn ProgressTracker>,
-    ) -> io::Result<()> {
-        let work = plan_tables(
-            table_sessions,
-            self.chunk_size_bytes,
-            ChunkFormat::Dat,
-            &progress,
-        );
-        progress.start();
-
-        let this = self.clone();
-        run_plans(work, num_threads, move |planned, num_threads| {
-            let format = this.clone();
-            let base_location = this.base_location.clone();
-            async move { generate_table(format, base_location, planned, num_threads).await }
-        })
-        .await
-    }
 }
 
-impl RowFormat for Dat {
-    const EXTENSION: &'static str = "dat";
-
-    /// DAT output has no header.
-    fn write_header(&self, _table: Table, buffer: Vec<u8>) -> Vec<u8> {
-        buffer
-    }
-
-    fn write_rows<I>(&self, _table: Table, rows: I, mut buffer: Vec<u8>) -> Vec<u8>
-    where
-        I: Iterator<Item = GeneratedRow>,
-    {
-        let mut writer = DatWriter::new(&mut buffer, self.compat_mode);
-        for row in rows {
-            // Writing to memory cannot fail, and every generated value is
-            // representable in the output encoding (the distributions the
-            // values come from are themselves ISO-8859-1).
-            writer
-                .write_display_row(&row)
-                .expect("DAT rows are always writable to memory");
+/// Define a [`Source`] that writes `$ROWS` in DAT format
+macro_rules! define_dat_source {
+    ($SOURCE_NAME:ident, $ROWS:ty) => {
+        pub(super) struct $SOURCE_NAME {
+            rows: $ROWS,
+            compat_mode: CompatMode,
         }
-        writer
-            .flush()
-            .expect("DAT rows are always writable to memory");
-        drop(writer);
 
-        buffer
-    }
+        impl $SOURCE_NAME {
+            pub(super) fn new(rows: $ROWS, compat_mode: CompatMode) -> Self {
+                Self { rows, compat_mode }
+            }
+        }
+
+        impl Source for $SOURCE_NAME {
+            /// DAT output has no header.
+            fn header(&self, buffer: Vec<u8>) -> Vec<u8> {
+                buffer
+            }
+
+            fn create(self, mut buffer: Vec<u8>) -> Vec<u8> {
+                let mut writer = DatWriter::new(&mut buffer, self.compat_mode);
+                for row in self.rows {
+                    // Writing to memory cannot fail, and every generated value is
+                    // representable in the output encoding (the distributions the
+                    // values come from are themselves ISO-8859-1).
+                    writer
+                        .write_display_row(&row)
+                        .expect("DAT rows are always writable to memory");
+                }
+                writer
+                    .flush()
+                    .expect("DAT rows are always writable to memory");
+                drop(writer);
+
+                buffer
+            }
+        }
+    };
 }
+
+// Define .dat sources for all tables
+define_dat_source!(CallCenterDatSource, CallCenterRowGenerator);
+define_dat_source!(CatalogPageDatSource, CatalogPageRowGenerator);
+define_dat_source!(CatalogReturnsDatSource, CatalogReturnsRowGenerator);
+define_dat_source!(CatalogSalesDatSource, CatalogSalesRowGenerator);
+define_dat_source!(CustomerDatSource, CustomerRowGenerator);
+define_dat_source!(CustomerAddressDatSource, CustomerAddressRowGenerator);
+define_dat_source!(
+    CustomerDemographicsDatSource,
+    CustomerDemographicsRowGenerator
+);
+define_dat_source!(DateDimDatSource, DateDimRowGenerator);
+define_dat_source!(DbgenVersionDatSource, DbgenVersionRowGenerator);
+define_dat_source!(
+    HouseholdDemographicsDatSource,
+    HouseholdDemographicsRowGenerator
+);
+define_dat_source!(IncomeBandDatSource, IncomeBandRowGenerator);
+define_dat_source!(InventoryDatSource, InventoryRowGenerator);
+define_dat_source!(ItemDatSource, ItemRowGenerator);
+define_dat_source!(PromotionDatSource, PromotionRowGenerator);
+define_dat_source!(ReasonDatSource, ReasonRowGenerator);
+define_dat_source!(ShipModeDatSource, ShipModeRowGenerator);
+define_dat_source!(StoreDatSource, StoreRowGenerator);
+define_dat_source!(StoreReturnsDatSource, StoreReturnsRowGenerator);
+define_dat_source!(StoreSalesDatSource, StoreSalesRowGenerator);
+define_dat_source!(TimeDimDatSource, TimeDimRowGenerator);
+define_dat_source!(WarehouseDatSource, WarehouseRowGenerator);
+define_dat_source!(WebPageDatSource, WebPageRowGenerator);
+define_dat_source!(WebReturnsDatSource, WebReturnsRowGenerator);
+define_dat_source!(WebSalesDatSource, WebSalesRowGenerator);
+define_dat_source!(WebSiteDatSource, WebSiteRowGenerator);

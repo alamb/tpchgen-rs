@@ -13,12 +13,14 @@
  */
 
 use crate::business_key_generator::make_business_key;
+use crate::config::Session;
 use crate::config::Table as ConfigTable;
+use crate::error::Result;
 use crate::generator::PromotionGeneratorColumn;
 use crate::join_key_utils::generate_join_key;
 use crate::nulls::create_null_bit_map;
 use crate::random::RandomValueGenerator;
-use crate::row::{AbstractRowGenerator, PromotionRow, RowGenerator, RowGeneratorResult};
+use crate::row::{AbstractRowGenerator, PromotionRow};
 use crate::table::Table;
 use crate::types::{Date, Decimal};
 
@@ -32,30 +34,41 @@ const PROMO_DETAIL_LENGTH_MAX: i32 = 60;
 
 pub struct PromotionRowGenerator {
     abstract_row_generator: AbstractRowGenerator,
+    session: Session,
+    current_row: u64,
+    row_count: u64,
 }
 
 impl PromotionRowGenerator {
-    pub fn new() -> Self {
+    /// Generate source rows `1..=row_count`.
+    pub fn new(session: Session, row_count: u64) -> Self {
         PromotionRowGenerator {
             abstract_row_generator: AbstractRowGenerator::new(Table::Promotion),
+            session,
+            current_row: 1,
+            row_count,
         }
     }
-}
 
-impl Default for PromotionRowGenerator {
-    fn default() -> Self {
-        Self::new()
+    /// Start generating at `starting_row_number` (1-based), fast forwarding
+    /// the random number streams to that row.
+    pub fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
+        self.abstract_row_generator
+            .skip_rows_until_starting_row_number(starting_row_number);
+        self.current_row = starting_row_number;
     }
-}
 
-impl RowGenerator for PromotionRowGenerator {
-    fn generate_row_and_child_rows(
-        &mut self,
-        row_number: u64,
-        session: &crate::config::Session,
-        _parent_row_generator: Option<&mut dyn RowGenerator>,
-        _child_row_generator: Option<&mut dyn RowGenerator>,
-    ) -> crate::error::Result<RowGeneratorResult> {
+    /// Restrict generation to source rows
+    /// `starting_row_number..=ending_row_number` (1-based, inclusive).
+    ///
+    /// The ending row number is clamped to the table's row count.
+    pub fn set_source_row_range(&mut self, starting_row_number: u64, ending_row_number: u64) {
+        self.skip_rows_until_starting_row_number(starting_row_number);
+        self.row_count = self.row_count.min(ending_row_number);
+    }
+
+    fn generate_promotion_row(&mut self, row_number: u64) -> Result<PromotionRow> {
+        let session = &self.session;
         let row_number_i64 = i64::try_from(row_number).expect("row number fits in i64");
 
         let scaling = session.get_scaling();
@@ -151,7 +164,7 @@ impl RowGenerator for PromotionRowGenerator {
 
         let p_purpose = "Unknown".to_string();
 
-        Ok(RowGeneratorResult::new(PromotionRow::new(
+        Ok(PromotionRow::new(
             null_bit_map,
             p_promo_sk,
             p_promo_id,
@@ -172,17 +185,24 @@ impl RowGenerator for PromotionRowGenerator {
             p_channel_details,
             p_purpose,
             p_discount_active,
-        )))
+        ))
     }
+}
 
-    fn consume_remaining_seeds_for_row(&mut self) {
+impl Iterator for PromotionRowGenerator {
+    type Item = PromotionRow;
+
+    fn next(&mut self) -> Option<PromotionRow> {
+        if self.current_row > self.row_count {
+            return None;
+        }
+        let row = self
+            .generate_promotion_row(self.current_row)
+            .expect("row gen");
         self.abstract_row_generator
             .consume_remaining_seeds_for_row();
-    }
-
-    fn skip_rows_until_starting_row_number(&mut self, starting_row_number: u64) {
-        self.abstract_row_generator
-            .skip_rows_until_starting_row_number(starting_row_number);
+        self.current_row += 1;
+        Some(row)
     }
 }
 
@@ -195,14 +215,8 @@ mod tests {
     fn test_generate_promotion_row() {
         use crate::config::Session;
 
-        let mut generator = PromotionRowGenerator::new();
-        let session = Session::default();
-
-        let result = generator.generate_row_and_child_rows(1, &session, None, None);
-        assert!(result.is_ok());
-
-        let row_result = result.unwrap();
-        let values = dat_values(&row_result.get_rows()[0]);
-        assert_eq!(values.len(), 19);
+        let mut generator = PromotionRowGenerator::new(Session::default(), 1);
+        let row = generator.next().expect("row");
+        assert_eq!(dat_values(&row).len(), 19);
     }
 }

@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "tpchgen")]
-#[command(version)]
 #[command(
     // -h output
     about = "TPC-H Data Generator",
@@ -251,10 +250,10 @@ struct ParquetArgs {
 
     /// Parquet block compression format.
     ///
-    /// Supported values: UNCOMPRESSED, ZSTD(N), SNAPPY, GZIP, LZO, BROTLI, LZ4
+    /// Supported values: UNCOMPRESSED, ZSTD(N), SNAPPY, GZIP(N), BROTLI(N), LZ4_RAW, LZ4
     ///
-    /// Note to use zstd you must supply the "compression" level (1-22)
-    /// as a number in parentheses, e.g. `ZSTD(1)` for level 1 compression.
+    /// ZSTD, GZIP, and BROTLI require a compression level as a number in
+    /// parentheses, e.g. `ZSTD(1)`. Levels: ZSTD 1-22, GZIP 0-9, BROTLI 0-11.
     ///
     /// Using `ZSTD` results in the best compression, but is about 2x slower than
     /// UNCOMPRESSED. For example, for the lineitem table at SF=10
@@ -304,6 +303,19 @@ struct ParquetArgs {
         help_heading = "Parquet Options"
     )]
     column_encoding: Option<Vec<(String, Encoding)>>,
+
+    /// Write Parquet field IDs (true or false).
+    ///
+    /// When true, each column gets a field ID equal to its 1-based position.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = ArgAction::Set,
+        value_name = "BOOL",
+        hide_possible_values = true,
+        help_heading = "Parquet Options"
+    )]
+    field_ids: bool,
 }
 
 // TableValueParser is CLI-specific and uses the Table type from the library
@@ -409,6 +421,7 @@ impl ParquetArgs {
             .with_parquet_compression(self.compression)
             .with_parquet_row_group_bytes(self.row_group_bytes)
             .with_parquet_column_encodings(self.column_encoding)
+            .with_parquet_field_ids(self.field_ids)
             .build()
             .generate()
             .await

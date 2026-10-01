@@ -12,6 +12,29 @@ mod tpch;
 #[path = "cli_integration/tpcds.rs"]
 mod tpcds;
 
+/// `-V`/`--version` is only available on `tpcgen-cli` itself, not on the
+/// benchmark subcommands.
+#[test]
+fn test_version() {
+    let expected = format!("tpcgen-cli {}\n", env!("CARGO_PKG_VERSION"));
+    for flag in ["-V", "--version"] {
+        cargo_bin_cmd!("tpcgen-cli")
+            .arg(flag)
+            .assert()
+            .success()
+            .stdout(expected.clone());
+        for benchmark in ["tpch", "tpcds"] {
+            cargo_bin_cmd!("tpcgen-cli")
+                .args([benchmark, flag])
+                .assert()
+                .failure()
+                .stderr(predicates::str::contains(format!(
+                    "unexpected argument '{flag}'"
+                )));
+        }
+    }
+}
+
 /// Scales above SF100000 generate and warn once on stderr in both benchmarks;
 /// SF100000 does not warn.
 #[test]
@@ -146,5 +169,30 @@ fn test_parquet_rejects_non_positive_row_group_bytes() {
                 "Invalid row-group size must not create output: {benchmark} {value}"
             );
         }
+    }
+}
+
+#[test]
+fn test_parquet_field_ids_false() {
+    for (benchmark, table) in [("tpch", "region"), ("tpcds", "reason")] {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+
+        cargo_bin_cmd!("tpcgen-cli")
+            .args([
+                benchmark,
+                "parquet",
+                "--scale-factor",
+                "0",
+                "--tables",
+                table,
+                "--field-ids=false",
+                "--no-progress",
+            ])
+            .arg("--output-dir")
+            .arg(temp_dir.path())
+            .assert()
+            .success();
+
+        test_helpers::expect_no_field_ids(&temp_dir.path().join(format!("{table}.parquet")));
     }
 }

@@ -165,6 +165,8 @@ pub struct GeneratorConfig {
     pub parquet_compression: Compression,
     /// Per-column Parquet encodings (overrides writer defaults)
     pub parquet_column_encodings: Option<Vec<(String, Encoding)>>,
+    /// Write sequential Parquet field IDs (1-based column positions)
+    pub parquet_field_ids: bool,
     /// Target row group size in bytes for Parquet files
     pub parquet_row_group_bytes: i64,
     /// Number of partitions to generate (if None, generates a single file per table)
@@ -189,6 +191,7 @@ impl Default for GeneratorConfig {
             num_threads: crate::args::default_num_threads(),
             parquet_compression: Compression::SNAPPY,
             parquet_column_encodings: None,
+            parquet_field_ids: true,
             parquet_row_group_bytes: DEFAULT_PARQUET_ROW_GROUP_BYTES,
             parts: None,
             part: None,
@@ -210,46 +213,6 @@ pub(super) fn table_schema(table: Table) -> SchemaRef {
         Table::Orders => OrderArrow::schema_ref(),
         Table::Lineitem => LineItemArrow::schema_ref(),
     }
-}
-
-/// Checks each column in `encodings` against every table in `tables`.
-///
-/// Rejects an encoding `reject_unsupported_encoding` always rejects.
-/// Rejects a column name that matches no table (almost always a typo). A
-/// column that matches only some tables is fine: [`column_encodings_for_table`]
-/// applies it there and skips it elsewhere.
-pub(super) fn validate_column_encodings(
-    tables: &[Table],
-    encodings: &[(String, Encoding)],
-) -> io::Result<()> {
-    for (col, enc) in encodings {
-        crate::parquet::reject_unsupported_encoding(*enc)?;
-        let matches_any_table = tables.iter().any(|table| {
-            table_schema(*table)
-                .fields()
-                .iter()
-                .any(|f| f.name() == col)
-        });
-        if !matches_any_table {
-            return Err(io::Error::other(format!(
-                "column '{col}' for --column-encoding not found in any selected table"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Keeps only the encodings whose column exists in `table`'s schema.
-pub(super) fn column_encodings_for_table(
-    table: Table,
-    encodings: &[(String, Encoding)],
-) -> Vec<(String, Encoding)> {
-    let schema = table_schema(table);
-    encodings
-        .iter()
-        .filter(|(col, _)| schema.fields().iter().any(|f| f.name() == col))
-        .cloned()
-        .collect()
 }
 
 /// TPC-H data generator
@@ -305,11 +268,14 @@ impl TpchGenerator {
         );
 
         // Reject a --column-encoding column that matches no selected table
-        // (a typo) before any work starts. column_encodings_for_table
-        // (below) skips a column that only matches some tables, so that
-        // case is not an error.
+        // (a typo) before any work starts. column_encodings_for_table skips
+        // a column that only matches some tables, so that case is not an
+        // error.
         if let Some(encodings) = &config.parquet_column_encodings {
-            validate_column_encodings(&tables, encodings)?;
+            crate::parquet::validate_column_encodings(
+                tables.iter().map(|table| table_schema(*table)),
+                encodings,
+            )?;
         }
 
         match config.format {
@@ -328,6 +294,7 @@ impl TpchGenerator {
             ParquetWriterOptions {
                 compression: config.parquet_compression,
                 column_encodings: config.parquet_column_encodings,
+                field_ids: config.parquet_field_ids,
             },
             config.parquet_row_group_bytes,
             base_location.clone(),
@@ -424,6 +391,12 @@ impl TpchGeneratorBuilder {
         self
     }
 
+    /// Set whether to write sequential Parquet field IDs (default: true).
+    pub fn with_parquet_field_ids(mut self, field_ids: bool) -> Self {
+        self.config.parquet_field_ids = field_ids;
+        self
+    }
+
     /// Set target row group size in bytes for Parquet files (default: 7MB).
     pub fn with_parquet_row_group_bytes(mut self, bytes: i64) -> Self {
         self.config.parquet_row_group_bytes = bytes;
@@ -516,45 +489,6 @@ mod tests {
         fn finish(&self) {
             self.finishes.fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    #[test]
-    fn validate_column_encodings_accepts_a_column_present_on_just_one_table() {
-        // l_comment exists only on lineitem, not orders.
-        let tables = [Table::Lineitem, Table::Orders];
-        let encodings = [("l_comment".to_string(), Encoding::PLAIN)];
-        assert!(validate_column_encodings(&tables, &encodings).is_ok());
-    }
-
-    #[test]
-    fn validate_column_encodings_rejects_a_typo() {
-        let tables = [Table::Lineitem, Table::Orders];
-        let encodings = [("l_comment_typo".to_string(), Encoding::PLAIN)];
-        let err = validate_column_encodings(&tables, &encodings).unwrap_err();
-        assert!(err.to_string().contains("column 'l_comment_typo'"), "{err}");
-    }
-
-    #[test]
-    fn validate_column_encodings_rejects_dictionary_encoding() {
-        let tables = [Table::Lineitem];
-        let encodings = [("l_comment".to_string(), Encoding::PLAIN_DICTIONARY)];
-        assert!(validate_column_encodings(&tables, &encodings).is_err());
-    }
-
-    #[test]
-    fn column_encodings_for_table_keeps_only_matching_columns() {
-        let encodings = [
-            ("l_comment".to_string(), Encoding::PLAIN),
-            ("o_comment".to_string(), Encoding::PLAIN),
-        ];
-        assert_eq!(
-            column_encodings_for_table(Table::Lineitem, &encodings),
-            vec![("l_comment".to_string(), Encoding::PLAIN)]
-        );
-        assert_eq!(
-            column_encodings_for_table(Table::Nation, &encodings),
-            Vec::new()
-        );
     }
 
     #[tokio::test]
