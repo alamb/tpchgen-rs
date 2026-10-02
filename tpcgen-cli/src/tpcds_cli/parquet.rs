@@ -1,17 +1,14 @@
 //! TPC-DS Parquet output.
 
 use super::generate::output_location_for_table;
-use super::plan::{ChunkFormat, TpcdsGenerationPlan};
-use super::runner::{plan_tables, run_plans, PlannedTable};
+use super::runner::PlannedTable;
 use crate::output_location::OutputLocation;
 use crate::parquet::ParquetOutput;
-use crate::progress::{ProgressHandle, ProgressTracker};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatchReader;
 use log::info;
 use parquet::basic::{Compression, Encoding};
 use std::io;
-use std::sync::Arc;
 use tpcdsgen::config::{Session, Table};
 use tpcdsgen_arrow::{
     CallCenterArrow, CatalogPageArrow, CatalogReturnsArrow, CatalogSalesArrow,
@@ -119,374 +116,16 @@ impl Parquet {
         }
     }
 
-    /// Generate the given TPC-DS tables as Parquet files.
-    pub(super) async fn generate_tables(
-        &self,
-        table_sessions: Vec<(Table, Session)>,
-        num_threads: usize,
-        progress: Arc<dyn ProgressTracker>,
-    ) -> io::Result<()> {
-        // Reject a --column-encoding column that matches no selected table
-        // (a typo) before any work starts. column_encodings_for_table
-        // (below) skips a column that only matches some tables, so that
-        // case is not an error.
+    /// Reject a `--column-encoding` column that matches no selected table
+    /// (a typo) before any work starts. `column_encodings_for_table` skips a
+    /// column that only matches some tables, so that case is not an error.
+    pub(super) fn validate(&self, table_sessions: &[(Table, Session)]) -> io::Result<()> {
         if let Some(encodings) = &self.column_encodings {
             let selected_tables: Vec<Table> =
                 table_sessions.iter().map(|(table, _)| *table).collect();
             validate_column_encodings(&selected_tables, encodings)?;
         }
-
-        let work = plan_tables(
-            table_sessions,
-            self.row_group_bytes,
-            ChunkFormat::Parquet,
-            &progress,
-        );
-        progress.start();
-
-        let this = self.clone();
-        run_plans(work, num_threads, move |planned, num_threads| {
-            let this = this.clone();
-            async move { this.generate_table(planned, num_threads).await }
-        })
-        .await
-    }
-
-    /// Generate one planned table (one `--parts` chunk of one table) as a
-    /// Parquet file using `num_threads` threads.
-    async fn generate_table(&self, planned: PlannedTable, num_threads: usize) -> io::Result<()> {
-        let PlannedTable {
-            table,
-            session,
-            plan,
-            progress,
-        } = planned;
-        match table {
-            Table::CallCenter => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        CallCenterArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::CatalogPage => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        CatalogPageArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::CatalogReturns => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        CatalogReturnsArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::CatalogSales => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        CatalogSalesArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::Customer => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        CustomerArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::CustomerAddress => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        CustomerAddressArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::CustomerDemographics => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        CustomerDemographicsArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::DateDim => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        DateDimArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::DbgenVersion => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        DbgenVersionArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::HouseholdDemographics => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        HouseholdDemographicsArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::IncomeBand => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        IncomeBandArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::Inventory => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        InventoryArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::Item => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| ItemArrow::new(session).with_source_row_range(start, end),
-                )
-                .await
-            }
-            Table::Promotion => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        PromotionArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::Reason => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        ReasonArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::ShipMode => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        ShipModeArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::Store => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        StoreArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::StoreReturns => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        StoreReturnsArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::StoreSales => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        StoreSalesArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::TimeDim => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        TimeDimArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::Warehouse => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        WarehouseArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::WebPage => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        WebPageArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::WebReturns => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        WebReturnsArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::WebSales => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        WebSalesArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            Table::WebSite => {
-                self.write_table(
-                    table,
-                    session,
-                    plan,
-                    num_threads,
-                    progress,
-                    |session, start, end| {
-                        WebSiteArrow::new(session).with_source_row_range(start, end)
-                    },
-                )
-                .await
-            }
-            _ => Ok(()),
-        }
+        Ok(())
     }
 
     /// Write one table to a Parquet file at the specified path.
@@ -497,20 +136,24 @@ impl Parquet {
     ///
     /// Progress is reported in row groups: the shared writer advances by
     /// one per written row group (the same output units as TPC-H parquet
-    /// generation; the totals are registered in [`Self::generate_tables`]).
-    async fn write_table<R, F>(
+    /// generation; the totals are registered by [`super::runner::plan_tables`]).
+    pub(super) async fn write_table<R, F>(
         &self,
-        table: Table,
-        session: Session,
-        plan: TpcdsGenerationPlan,
+        planned: PlannedTable,
         num_threads: usize,
-        progress: ProgressHandle,
         make_reader: F,
     ) -> io::Result<()>
     where
         R: RecordBatchReader + Send + 'static,
         F: Fn(Session, u64, u64) -> R + Send + 'static,
     {
+        let PlannedTable {
+            table,
+            session,
+            plan,
+            progress,
+        } = planned;
+
         // Keep only the encodings for columns on this table.
         // --column-encoding usually targets a few tables, not all of them.
         let column_encodings = self

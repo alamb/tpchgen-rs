@@ -12,7 +12,8 @@
  * limitations under the License.
  */
 
-//! [`SalesRowIter`]: stream concrete rows from a [`SalesRowGenerator`].
+//! [`SalesRowIter`]: stream concrete rows from a [`SalesRowGenerator`], and
+//! [`SalesOnlyIter`] / [`ReturnsOnlyIter`] for just one of its tables.
 
 use crate::config::Session;
 use crate::row::{SalesRowGenerator, SalesRows};
@@ -20,8 +21,8 @@ use crate::row::{SalesRowGenerator, SalesRows};
 /// Adapts a [`SalesRowGenerator`] into an [`Iterator`] of its concrete
 /// [`SalesRows`] type, one per line item.
 ///
-/// Callers wanting only the sales rows map to `.sales`; callers wanting only
-/// the returns rows filter on `.returns`.
+/// Callers wanting only the sales rows use [`SalesOnlyIter`]; callers wanting
+/// only the returns rows use [`ReturnsOnlyIter`].
 ///
 /// It is possible to restrict the iterator to a range of source rows with
 /// [`Self::set_source_row_range`].
@@ -77,5 +78,55 @@ impl<G: SalesRowGenerator> Iterator for SalesRowIter<G> {
             self.current_row += 1;
         }
         Some(rows)
+    }
+}
+
+/// The sales rows of a [`SalesRowIter`].
+pub struct SalesOnlyIter<G: SalesRowGenerator>(SalesRowIter<G>);
+
+impl<G: SalesRowGenerator> SalesOnlyIter<G> {
+    /// Generate the sales rows of source rows `1..=row_count`.
+    pub fn new(generator: G, session: Session, row_count: u64) -> Self {
+        Self(SalesRowIter::new(generator, session, row_count))
+    }
+
+    /// Restrict generation to source rows
+    /// `starting_row_number..=ending_row_number` (1-based, inclusive).
+    pub fn set_source_row_range(&mut self, starting_row_number: u64, ending_row_number: u64) {
+        self.0
+            .set_source_row_range(starting_row_number, ending_row_number)
+    }
+}
+
+impl<G: SalesRowGenerator> Iterator for SalesOnlyIter<G> {
+    type Item = G::Sales;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.find_map(|rows| rows.sales)
+    }
+}
+
+/// The returns rows of a [`SalesRowIter`].
+pub struct ReturnsOnlyIter<G: SalesRowGenerator>(SalesRowIter<G>);
+
+impl<G: SalesRowGenerator> ReturnsOnlyIter<G> {
+    /// Generate the returns rows of source rows `1..=row_count`.
+    pub fn new(generator: G, session: Session, row_count: u64) -> Self {
+        Self(SalesRowIter::new(generator, session, row_count))
+    }
+
+    /// Restrict generation to source rows
+    /// `starting_row_number..=ending_row_number` (1-based, inclusive).
+    pub fn set_source_row_range(&mut self, starting_row_number: u64, ending_row_number: u64) {
+        self.0
+            .set_source_row_range(starting_row_number, ending_row_number)
+    }
+}
+
+impl<G: SalesRowGenerator> Iterator for ReturnsOnlyIter<G> {
+    type Item = G::Returns;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.find_map(|rows| rows.returns)
     }
 }

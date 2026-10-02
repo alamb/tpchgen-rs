@@ -14,7 +14,7 @@ pub use generated_row::GeneratedRow;
 pub use row_generator::{RowGenerator, RowGeneratorResult, SalesReturnsSelection};
 pub use row_iter::RowIter;
 pub use sales_row_generator::{SalesRowGenerator, SalesRows};
-pub use sales_row_iter::SalesRowIter;
+pub use sales_row_iter::{ReturnsOnlyIter, SalesOnlyIter, SalesRowIter};
 pub use single_row_generator::SingleRowGenerator;
 pub use single_row_iter::SingleRowIter;
 

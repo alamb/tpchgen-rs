@@ -398,23 +398,9 @@ impl CommonArgs {
         // creates no directories)
         base_location.create_dir_all()?;
 
-        match output_format {
-            OutputFormat::Dat(output) => {
-                output
-                    .generate_tables(table_sessions, num_threads, progress.clone())
-                    .await?;
-            }
-            OutputFormat::Csv(output) => {
-                output
-                    .generate_tables(table_sessions, num_threads, progress.clone())
-                    .await?;
-            }
-            OutputFormat::Parquet(output) => {
-                output
-                    .generate_tables(table_sessions, num_threads, progress.clone())
-                    .await?;
-            }
-        }
+        output_format
+            .generate_tables(table_sessions, num_threads, progress.clone())
+            .await?;
 
         progress.finish();
         info!("Generation complete in {:.2?}!", total_start.elapsed());
